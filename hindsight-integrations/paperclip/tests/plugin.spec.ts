@@ -584,6 +584,73 @@ describe("hindsight_recall tool", () => {
   });
 });
 
+describe("tools called with empty arguments", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("recall without a query returns run-start memories plus guidance and does not call Hindsight", async () => {
+    const harness = buildHarness();
+    await setupPlugin(harness);
+    const issue = await seedIssue(harness, { companyId: "co-1", title: "Update UI" });
+
+    vi.stubGlobal(
+      "fetch",
+      mockFetch([{ url: /recall/, body: { results: [{ text: "User prefers dark mode" }] } }])
+    );
+    await harness.emit(
+      "agent.run.started",
+      { agentId: "ag-1", runId: "run-1", issueId: issue.id },
+      { companyId: "co-1" }
+    );
+    const callsBefore = (vi.mocked(fetch) as ReturnType<typeof vi.fn>).mock.calls.length;
+
+    const result = await harness.executeTool(
+      "hindsight_recall",
+      {},
+      { agentId: "ag-1", runId: "run-1", companyId: "co-1", projectId: "proj-1" }
+    );
+
+    const content = (result as { content: string }).content;
+    expect(content).toContain('needs a non-empty "query"');
+    expect(content).toContain("dark mode");
+    expect((vi.mocked(fetch) as ReturnType<typeof vi.fn>).mock.calls.length).toBe(callsBefore);
+  });
+
+  it("recall with a blank query and no cached memories returns guidance instead of throwing", async () => {
+    const fetchSpy = mockFetch([]);
+    vi.stubGlobal("fetch", fetchSpy);
+    const harness = buildHarness();
+    await setupPlugin(harness);
+
+    const result = await harness.executeTool(
+      "hindsight_recall",
+      { query: "   " },
+      { agentId: "ag-1", runId: "run-9", companyId: "co-1", projectId: "proj-1" }
+    );
+
+    expect((result as { content: string }).content).toContain('needs a non-empty "query"');
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("retain without content returns a message and stores nothing", async () => {
+    const fetchSpy = mockFetch([]);
+    vi.stubGlobal("fetch", fetchSpy);
+    const harness = buildHarness();
+    await setupPlugin(harness);
+
+    const result = await harness.executeTool(
+      "hindsight_retain",
+      {},
+      { agentId: "ag-1", runId: "run-9", companyId: "co-1", projectId: "proj-1" }
+    );
+
+    expect((result as { content: string }).content).toContain("Nothing was stored");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
 describe("HindsightClient timeout", () => {
   afterEach(() => {
     vi.restoreAllMocks();

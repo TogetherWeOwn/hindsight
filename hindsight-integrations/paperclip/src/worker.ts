@@ -83,6 +83,13 @@ function isAgentEnabled(config: PluginConfig, agentId: string | undefined | null
   return !!agentId && allowlist.includes(agentId);
 }
 
+/** Returns the trimmed string value of `key` in a tool's params, or "" when missing or not a string. */
+function readStringParam(params: unknown, key: string): string {
+  if (!params || typeof params !== "object") return "";
+  const value = (params as Record<string, unknown>)[key];
+  return typeof value === "string" ? value.trim() : "";
+}
+
 const plugin = definePlugin({
   async setup(ctx) {
     ctx.logger.info("Hindsight memory plugin starting");
@@ -291,7 +298,25 @@ const plugin = definePlugin({
         },
       },
       async (params: unknown, runCtx: ToolRunContext) => {
-        const { query } = params as { query: string };
+        const query = readStringParam(params, "query");
+        if (!query) {
+          // Models sometimes call the tool with no arguments. Return the
+          // run-start memories (if any) plus guidance instead of throwing,
+          // which would surface as a transport error to the agent.
+          const cached = await ctx.state.get({
+            scopeKind: "run",
+            scopeId: runCtx.runId,
+            stateKey: "recalled-memories",
+          });
+          const guidance =
+            'hindsight_recall needs a non-empty "query" string describing what to look up.';
+          return {
+            content:
+              cached && typeof cached === "string"
+                ? `${guidance} Returning the memories already recalled for this run.\n\n${cached}`
+                : guidance,
+          };
+        }
         const config = await getConfig(ctx);
 
         // Read userId cached by agent.run.started for consistent bank derivation
@@ -370,7 +395,13 @@ const plugin = definePlugin({
         },
       },
       async (params: unknown, runCtx: ToolRunContext) => {
-        const { content } = params as { content: string };
+        const rawContent = (params as { content?: unknown } | null)?.content;
+        const content = typeof rawContent === "string" ? rawContent : "";
+        if (!content.trim()) {
+          return {
+            content: 'hindsight_retain needs a non-empty "content" string. Nothing was stored.',
+          };
+        }
         const config = await getConfig(ctx);
 
         // Read userId cached by agent.run.started for consistent bank derivation
