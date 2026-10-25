@@ -21,6 +21,13 @@ import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
 import type { EnvSecretRefBinding, PluginContext, ToolRunContext } from "@paperclipai/plugin-sdk";
 import { HindsightClient, formatMemories } from "./client.js";
 import { deriveBankId, extractUserFromIssue } from "./bank.js";
+import {
+  assessWrite,
+  toAssessmentMetadata,
+  updateSeenWindow,
+  type WriteAssessment,
+  type WriteAssessmentPath,
+} from "./write-assessment.js";
 
 interface PluginConfig {
   hindsightApiUrl: string;
@@ -81,6 +88,103 @@ function isAgentEnabled(config: PluginConfig, agentId: string | undefined | null
   const allowlist = config.enabledAgentIds;
   if (!allowlist || allowlist.length === 0) return true;
   return !!agentId && allowlist.includes(agentId);
+}
+
+type AssessmentCtx = Pick<PluginContext, "state" | "metrics" | "logger">;
+
+/**
+ * Best-effort metric write. Telemetry must never break retention: a metrics
+ * outage is recorded in the logs (content-free) and the write proceeds.
+ */
+async function safeMetric(
+  ctx: AssessmentCtx,
+  name: string,
+  value: number,
+  tags?: Record<string, string>
+): Promise<void> {
+  try {
+    await ctx.metrics.write(name, value, tags);
+  } catch (err) {
+    ctx.logger.warn("Failed to write plugin metric", {
+      metric: name,
+      error: String(err),
+    });
+  }
+}
+
+interface AssessmentRequest {
+  path: WriteAssessmentPath;
+  content: unknown;
+  trustedSource: unknown;
+  /** Stable event identity, or null when the path has none (explicit tool). */
+  replayIdentity: string | null;
+  /** Company scope for the replay window. */
+  companyId: string;
+}
+
+const DEDUP_STATE_KEY = "seen-events";
+
+/**
+ * Assess a pending retain write and report it. Reads the bounded replay
+ * window (paths with an event identity only), runs the pure assessment,
+ * records the window update, and emits counters. Every host facility here is
+ * individually guarded — a state/metrics outage degrades the record (visible
+ * as `dedup_unavailable` / log warnings), never the retention.
+ */
+async function assessRetainWrite(
+  ctx: AssessmentCtx,
+  req: AssessmentRequest
+): Promise<WriteAssessment> {
+  const scope = {
+    scopeKind: "company" as const,
+    scopeId: req.companyId,
+    namespace: "write-assessment",
+    stateKey: DEDUP_STATE_KEY,
+  };
+  let seen: unknown = null;
+  if (req.replayIdentity !== null) {
+    try {
+      // null means "no window stored yet" (first write), which is an empty
+      // window — not an outage. Only a throw is dedup_unavailable.
+      const stored = await ctx.state.get(scope);
+      seen = stored === null ? [] : stored;
+    } catch (err) {
+      // seen stays null → dedup_unavailable code; the write still proceeds.
+      ctx.logger.warn("Write-assessment replay window unreadable", {
+        error: String(err),
+      });
+    }
+  }
+
+  const assessment = assessWrite({
+    path: req.path,
+    content: req.content,
+    trustedSource: req.trustedSource,
+    replayIdentity: req.replayIdentity,
+    seenIdentities: seen,
+  });
+
+  if (req.replayIdentity !== null) {
+    try {
+      await ctx.state.set(scope, updateSeenWindow(seen, req.replayIdentity));
+    } catch (err) {
+      ctx.logger.warn("Write-assessment replay window unwritable", {
+        error: String(err),
+      });
+    }
+  }
+
+  await safeMetric(ctx, "write_assessment.total", 1, {
+    path: req.path,
+    advisory: String(assessment.advisory),
+  });
+  for (const reason of assessment.reasonCodes) {
+    await safeMetric(ctx, "write_assessment.reason", 1, { path: req.path, reason });
+  }
+  if (assessment.reasonCodes.includes("assessment_error")) {
+    await safeMetric(ctx, "write_assessment.assessment_error", 1, { path: req.path });
+  }
+  return assessment;
 }
 
 const plugin = definePlugin({
@@ -236,6 +340,16 @@ const plugin = definePlugin({
         return;
       }
 
+      // Report-only assessment before the network write; the write proceeds
+      // regardless of the outcome. Identity comes from trusted runtime context.
+      const assessment = await assessRetainWrite(ctx, {
+        path: "auto-comment",
+        content: body,
+        trustedSource: { companyId, agentId: bankAgentId, issueId, commentId },
+        replayIdentity: `comment:${commentId}`,
+        companyId,
+      });
+
       try {
         const apiKey = await resolveApiKey(ctx, config, companyId);
         const client = new HindsightClient(config.hindsightApiUrl, apiKey, config.requestTimeoutMs);
@@ -245,9 +359,17 @@ const plugin = definePlugin({
           companyId,
           issueId,
           commentId,
+          ...toAssessmentMetadata(assessment),
         });
-        ctx.logger.info("Retained comment to memory", { commentId, bankId });
+        await safeMetric(ctx, "write_assessment.retain_accepted", 1, { path: "auto-comment" });
+        ctx.logger.info("Retained comment to memory", {
+          commentId,
+          bankId,
+          advisory: assessment.advisory,
+          reasonCodes: assessment.reasonCodes.join(","),
+        });
       } catch (err) {
+        await safeMetric(ctx, "write_assessment.retain_failed", 1, { path: "auto-comment" });
         ctx.logger.warn("Failed to retain comment", {
           commentId,
           error: String(err),
@@ -389,6 +511,21 @@ const plugin = definePlugin({
           config
         );
 
+        // Report-only assessment before the network write; the write proceeds
+        // regardless of the outcome. No replay identity: re-saving the same
+        // text is legitimate here, not an event redelivery.
+        const assessment = await assessRetainWrite(ctx, {
+          path: "explicit-tool",
+          content,
+          trustedSource: {
+            companyId: runCtx.companyId,
+            agentId: runCtx.agentId,
+            runId: runCtx.runId,
+          },
+          replayIdentity: null,
+          companyId: runCtx.companyId,
+        });
+
         try {
           const apiKey = await resolveApiKey(ctx, config, runCtx.companyId);
           const client = new HindsightClient(
@@ -400,9 +537,12 @@ const plugin = definePlugin({
             agentId: runCtx.agentId,
             companyId: runCtx.companyId,
             runId: runCtx.runId,
+            ...toAssessmentMetadata(assessment),
           });
+          await safeMetric(ctx, "write_assessment.retain_accepted", 1, { path: "explicit-tool" });
           return { content: "Memory saved." };
         } catch (err) {
+          await safeMetric(ctx, "write_assessment.retain_failed", 1, { path: "explicit-tool" });
           return { content: `Failed to save memory: ${String(err)}` };
         }
       }
