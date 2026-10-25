@@ -87,6 +87,20 @@ The bundled plugin manifest declares the `issues.read` and `issue.comments.read`
 
 Memory is keyed to `companyId` + `agentId`, never to the Paperclip session or run ID — so it survives across any number of runs.
 
+## Write Assessment (Report-Only)
+
+Every retain — automatic comment capture and `hindsight_retain` alike — is
+assessed by a pure deterministic function before the network write. The
+assessment attaches additive `hindsight.write_assessment.*` metadata
+(policy version, sha256 content digest, reason codes, advisory flag, path,
+trusted source scope, truncation flag) and emits `write_assessment.*`
+metric counters. It never drops, delays, or alters a write: findings are
+advisory signals (prompt-injection prose, forged approvals, identity claims
+that contradict the trusted bank context, unicode ambiguity, redelivered
+comment events), not a poisoning verdict. Assessment, replay-window, or
+telemetry failures degrade the record — visible as reason codes and log
+warnings — never the retention.
+
 ## Development
 
 ```bash
