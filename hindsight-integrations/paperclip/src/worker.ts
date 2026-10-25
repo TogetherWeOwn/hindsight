@@ -142,12 +142,14 @@ async function assessRetainWrite(
     stateKey: DEDUP_STATE_KEY,
   };
   let seen: unknown = null;
+  let windowReadable = false;
   if (req.replayIdentity !== null) {
     try {
       // null means "no window stored yet" (first write), which is an empty
       // window — not an outage. Only a throw is dedup_unavailable.
       const stored = await ctx.state.get(scope);
       seen = stored === null ? [] : stored;
+      windowReadable = true;
     } catch (err) {
       // seen stays null → dedup_unavailable code; the write still proceeds.
       ctx.logger.warn("Write-assessment replay window unreadable", {
@@ -164,7 +166,9 @@ async function assessRetainWrite(
     seenIdentities: seen,
   });
 
-  if (req.replayIdentity !== null) {
+  // A failed read used to replace the existing window with a singleton. Leave
+  // it untouched on read failure; successfully read corrupt values still heal.
+  if (req.replayIdentity !== null && windowReadable) {
     try {
       await ctx.state.set(scope, updateSeenWindow(seen, req.replayIdentity));
     } catch (err) {

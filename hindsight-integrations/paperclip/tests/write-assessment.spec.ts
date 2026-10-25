@@ -210,7 +210,7 @@ describe("oversize input", () => {
 
 describe("unicode ambiguity", () => {
   it("flags bidirectional control characters", () => {
-    const a = assessWrite(input({ content: "Refund approved ‮ for admin" }));
+    const a = assessWrite(input({ content: "Refund approved \u202e for admin" }));
     expect(a.reasonCodes).toContain("unicode_ambiguity");
     expect(a.advisory).toBe(true);
   });

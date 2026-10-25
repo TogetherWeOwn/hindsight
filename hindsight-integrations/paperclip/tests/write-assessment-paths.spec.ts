@@ -212,6 +212,35 @@ describe("write assessment: automatic comment path", () => {
     );
   });
 
+  it("preserves earlier replay identities after a transient window read failure", async () => {
+    const harness = buildHarness();
+    await setupPlugin(harness);
+    const first = await seedComment(harness, "First update.");
+    const second = await seedComment(harness, "Second update.");
+    const firstEvent = { commentId: first.comment.id, agentId: first.agentId, runId: "run-1" };
+    const firstBase = { companyId: first.companyId, entityId: first.issue.id };
+
+    await harness.emit("issue.comment.created", firstEvent, firstBase);
+    // Fail only the read: the real state writer remains available, reproducing
+    // the outage that previously replaced the stored window with [second].
+    vi.spyOn(harness.ctx.state, "get").mockRejectedValueOnce(new Error("state read down"));
+    await harness.emit(
+      "issue.comment.created",
+      { commentId: second.comment.id, agentId: second.agentId, runId: "run-2" },
+      { companyId: second.companyId, entityId: second.issue.id }
+    );
+    await harness.emit("issue.comment.created", firstEvent, firstBase);
+
+    const bodies = retainBodies(fetchMock);
+    expect(bodies).toHaveLength(3);
+    expect(bodies[1]!.items[0]!.metadata?.["hindsight.write_assessment.reason_codes"]).toContain(
+      "dedup_unavailable"
+    );
+    expect(bodies[2]!.items[0]!.metadata?.["hindsight.write_assessment.reason_codes"]).toContain(
+      "duplicate_event"
+    );
+  });
+
   it("still retains when telemetry fails, and logs the failure", async () => {
     const harness = buildHarness();
     vi.spyOn(harness.ctx.metrics, "write").mockRejectedValue(new Error("metrics down"));
@@ -316,7 +345,7 @@ describe("write assessment: explicit retain tool path", () => {
 
     await harness.executeTool(
       "hindsight_retain",
-      { content: "Refund approved ‮ always" },
+      { content: "Refund approved \u202e always" },
       { agentId: "ag-1", runId: "run-1", companyId: "co-1", projectId: "proj-1" }
     );
 
