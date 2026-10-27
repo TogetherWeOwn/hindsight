@@ -364,7 +364,7 @@ describe("issue.comment.created", () => {
     vi.unstubAllGlobals();
   });
 
-  it("retains the full comment body with the commentId as document ID", async () => {
+  it("retains the full comment body with immutable version identity and original comment provenance", async () => {
     const harness = buildHarness();
     await setupPlugin(harness);
     const issue = await seedIssue(harness, {
@@ -388,10 +388,13 @@ describe("issue.comment.created", () => {
     const retainCall = fetchMock.mock.calls.find(([url]: [string]) => /memories$/.test(url));
     expect(retainCall).toBeDefined();
     const body = JSON.parse(retainCall?.[1]?.body as string) as {
-      items: Array<{ content: string; document_id?: string }>;
+      items: Array<{ content: string; document_id?: string; metadata?: Record<string, string> }>;
     };
     expect(body.items[0]?.content).toContain("JWT");
-    expect(body.items[0]?.document_id).toBe(comment.id);
+    expect(body.items[0]?.document_id).toEqual(expect.any(String));
+    expect(body.items[0]?.document_id?.trim().length).toBeGreaterThan(0);
+    expect(body.items[0]?.document_id).not.toBe(comment.id);
+    expect(body.items[0]?.metadata?.["paperclip.provenance.source_id"]).toBe(comment.id);
   });
 
   it("skips retain when comment has no agent author and issue has no assignee", async () => {
@@ -868,8 +871,7 @@ describe("hindsightApiKeyRef", () => {
     // its own picker submits: "Configuration does not match the plugin's
     // instanceConfigSchema". The schema must admit the reference object too.
     const objectBranch = field?.oneOf?.find((branch) => branch.type === "object") as
-      | { required?: string[]; properties?: Record<string, unknown> }
-      | undefined;
+      { required?: string[]; properties?: Record<string, unknown> } | undefined;
     expect(objectBranch).toBeDefined();
     expect(objectBranch?.required).toEqual(["type", "secretId"]);
     expect(field?.oneOf?.some((branch) => branch.type === "string")).toBe(true);

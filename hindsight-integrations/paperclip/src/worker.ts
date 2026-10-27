@@ -17,10 +17,12 @@
  *   hindsight_retain(content) → store content in memory immediately
  */
 
+import { createHash, randomUUID } from "node:crypto";
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
 import type { EnvSecretRefBinding, PluginContext, ToolRunContext } from "@paperclipai/plugin-sdk";
-import { HindsightClient, formatMemories } from "./client.js";
+import { HindsightClient, formatMemories, formatTimestamp } from "./client.js";
 import { deriveBankId, extractUserFromIssue } from "./bank.js";
+import { retainParametersSchema } from "./manifest.js";
 import {
   assessWrite,
   toAssessmentMetadata,
@@ -43,6 +45,81 @@ interface PluginConfig {
   requestTimeoutMs?: number;
   autoRetain?: boolean;
   enabledAgentIds?: string[];
+}
+
+interface RunAttribution {
+  companyId: string;
+  agentId: string;
+  issueId: string;
+  userId?: string;
+  recall?: { query: string; scope: string; memories: string };
+}
+
+async function readRunAttribution(
+  ctx: PluginContext,
+  run: ToolRunContext
+): Promise<RunAttribution | undefined> {
+  const stored = await ctx.state.get({
+    scopeKind: "run",
+    scopeId: run.runId,
+    stateKey: "memory-attribution",
+  });
+  if (!stored || typeof stored !== "object") return undefined;
+  const value = stored as Partial<RunAttribution>;
+  if (
+    value.companyId !== run.companyId ||
+    value.agentId !== run.agentId ||
+    typeof value.issueId !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    companyId: value.companyId,
+    agentId: value.agentId,
+    issueId: value.issueId,
+    userId: typeof value.userId === "string" ? value.userId : undefined,
+    recall:
+      value.recall &&
+      typeof value.recall.query === "string" &&
+      typeof value.recall.scope === "string" &&
+      typeof value.recall.memories === "string"
+        ? value.recall
+        : undefined,
+  };
+}
+
+function recallScope(config: PluginConfig, bankId: string, attribution?: RunAttribution): string {
+  // Only binding identity is fingerprinted, never a resolved credential. A
+  // config/principal change must not reuse evidence from a different backend.
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        origin: config.hindsightApiUrl.trim().replace(/\/$/, ""),
+        secretRef: config.hindsightApiKeyRef ?? null,
+        bankId,
+        budget: config.recallBudget ?? "mid",
+        companyId: attribution?.companyId,
+        agentId: attribution?.agentId,
+        issueId: attribution?.issueId,
+        userId: attribution?.userId,
+      })
+    )
+    .digest("hex");
+}
+
+function formatScopedMemories(
+  memories: Parameters<typeof formatMemories>[0],
+  bankId: string
+): string {
+  const text = formatMemories(memories);
+  if (!text) return "";
+  return `Backend bank scope: ${JSON.stringify(bankId)}. Shared/static bank configuration can share evidence across principals; metadata and tags are not authorization. Backend tenancy/access controls remain authoritative.\n${text}`;
+}
+
+function sourceTime(value: unknown): string {
+  return formatTimestamp(
+    value instanceof Date && Number.isFinite(value.getTime()) ? value.toISOString() : value
+  );
 }
 
 interface RunStartedPayload {
@@ -208,7 +285,19 @@ const plugin = definePlugin({
       const { agentId, runId, issueId } = payload;
       const companyId = event.companyId;
       if (!isAgentEnabled(config, agentId)) return;
-      if (!issueId || !companyId) return;
+      if (!companyId) return;
+      // Reused run IDs must not keep the prior issue/user or recalled evidence
+      // when the new host association is absent, unreadable or has no user.
+      await ctx.state.set(
+        { scopeKind: "run", scopeId: runId, stateKey: "memory-attribution" },
+        null
+      );
+      await ctx.state.set({ scopeKind: "run", scopeId: runId, stateKey: "user-id" }, null);
+      await ctx.state.set(
+        { scopeKind: "run", scopeId: runId, stateKey: "recalled-memories" },
+        null
+      );
+      if (!issueId) return;
 
       let issue;
       try {
@@ -224,7 +313,6 @@ const plugin = definePlugin({
       if (!issue) return;
 
       const query = [issue.title, issue.description].filter(Boolean).join("\n");
-      if (!query.trim()) return;
 
       // Extract userId from the specific issue being worked on (not an
       // arbitrary one from list). This is only used when bankGranularity
@@ -233,10 +321,17 @@ const plugin = definePlugin({
         ? extractUserFromIssue(issue)
         : undefined;
 
-      // Cache userId so tool calls within this run can derive the same bank ID
-      if (userId) {
-        await ctx.state.set({ scopeKind: "run", scopeId: runId, stateKey: "user-id" }, userId);
-      }
+      const attribution: RunAttribution = { companyId, agentId, issueId, userId };
+      await ctx.state.set(
+        { scopeKind: "run", scopeId: runId, stateKey: "memory-attribution" },
+        attribution
+      );
+      // Keep the host-visible scalar current, including explicitly absent users.
+      await ctx.state.set(
+        { scopeKind: "run", scopeId: runId, stateKey: "user-id" },
+        userId ?? null
+      );
+      if (!query.trim()) return;
 
       try {
         const apiKey = await resolveApiKey(ctx, config, companyId);
@@ -245,17 +340,20 @@ const plugin = definePlugin({
 
         const response = await client.recall(bankId, query, config.recallBudget ?? "mid");
 
-        const memories = formatMemories(response.results);
+        const memories = formatScopedMemories(response.results, bankId);
         if (memories) {
           await ctx.state.set(
             { scopeKind: "run", scopeId: runId, stateKey: "recalled-memories" },
             memories
           );
-          // Remember which query produced the cache, so the recall tool only
-          // reuses it for that same query.
+          // Publish the query, scope and formatted result atomically: separate
+          // cache keys could join a new principal to an old result after a race.
           await ctx.state.set(
-            { scopeKind: "run", scopeId: runId, stateKey: "recalled-query" },
-            query
+            { scopeKind: "run", scopeId: runId, stateKey: "memory-attribution" },
+            {
+              ...attribution,
+              recall: { query, scope: recallScope(config, bankId, attribution), memories },
+            }
           );
           ctx.logger.info("Recalled memories for run", {
             runId,
@@ -287,31 +385,27 @@ const plugin = definePlugin({
       const issueId = event.entityId;
       const payload = (event.payload ?? {}) as CommentCreatedPayload;
       const commentId = payload.commentId;
-      const payloadAgentId = payload.agentId ?? null;
       if (!issueId || !companyId || !commentId) return;
 
-      let body = "";
+      let comment;
       try {
         const comments = await ctx.issues.listComments(issueId, companyId);
-        const match = comments.find((c) => c.id === commentId);
-        if (match && typeof match.body === "string") body = match.body;
+        comment = comments.find(
+          (c) => c.id === commentId && c.companyId === companyId && c.issueId === issueId
+        );
       } catch (err) {
-        // Fall back to the truncated snippet if listComments isn't available.
-        if (typeof payload.bodySnippet === "string") {
-          body = payload.bodySnippet;
-        } else {
-          ctx.logger.warn("Failed to fetch comment body", {
-            commentId,
-            error: String(err),
-          });
-          return;
-        }
+        // A snippet is not a raw episode. Keep the failure visible rather than
+        // misrepresenting truncated text as a fully captured source document.
+        ctx.logger.warn("Failed to fetch full source comment", { commentId, error: String(err) });
+        return;
       }
-      if (!body.trim()) return;
+      if (!comment || typeof comment.body !== "string" || !comment.body.trim()) return;
+      const body = comment.body;
 
-      // Bank attribution: comments authored by an agent belong in that agent's
-      // bank; user/system comments fall back to the issue's assignee.
-      let bankAgentId: string | null = payloadAgentId;
+      // Fetch-authenticated author identity wins over payload/body claims.
+      // User/system authors remain distinct from the assignee whose bank stores
+      // their evidence; that bank agent is not misrepresented as the speaker.
+      let bankAgentId: string | null = comment.authorAgentId;
       let userId: string | undefined;
       let issueForAttribution;
       if (!bankAgentId || config.bankGranularity?.includes("user")) {
@@ -358,13 +452,40 @@ const plugin = definePlugin({
         const apiKey = await resolveApiKey(ctx, config, companyId);
         const client = new HindsightClient(config.hindsightApiUrl, apiKey, config.requestTimeoutMs);
         const bankId = deriveBankId({ companyId, agentId: bankAgentId, userId }, config);
-        await client.retain(bankId, body, commentId, {
-          agentId: bankAgentId,
-          companyId,
-          issueId,
-          commentId,
-          ...toAssessmentMetadata(assessment),
-        });
+        const createdAt = sourceTime(comment.createdAt);
+        const updatedAt = sourceTime(comment.updatedAt);
+        // Document replacement is native Hindsight behavior. Version the full
+        // source identity + bytes + trusted source revision clock so an edit,
+        // or a revert to earlier bytes (A→B→A), cannot overwrite a prior
+        // episode; a redelivery with the same body and source clock (capture
+        // time excluded) remains idempotent.
+        const digest = createHash("sha256")
+          .update(JSON.stringify([companyId, issueId, commentId, body, updatedAt]))
+          .digest("hex");
+        const runId = comment.createdByRunId ?? payload.runId ?? "unknown";
+        await client.retain(
+          bankId,
+          body,
+          `paperclip-comment-${digest}`,
+          {
+            agentId: bankAgentId,
+            companyId,
+            issueId,
+            commentId,
+            runId,
+            "paperclip.provenance.source_type": "issue_comment",
+            "paperclip.provenance.source_id": commentId,
+            "paperclip.provenance.source_ref": `paperclip:comment:${encodeURIComponent(companyId)}:${encodeURIComponent(issueId)}:${encodeURIComponent(commentId)}:${digest}`,
+            "paperclip.provenance.recorded_at": new Date().toISOString(),
+            "paperclip.provenance.source_created_at": createdAt,
+            "paperclip.provenance.source_updated_at": updatedAt,
+            "paperclip.provenance.role": comment.authorType ?? "unknown",
+            "paperclip.provenance.author_agent_id": comment.authorAgentId ?? "unknown",
+            "paperclip.provenance.author_user_id": comment.authorUserId ?? "unknown",
+            ...toAssessmentMetadata(assessment),
+          },
+          updatedAt !== "unknown" ? updatedAt : createdAt !== "unknown" ? createdAt : "unset"
+        );
         await safeMetric(ctx, "write_assessment.retain_accepted", 1, { path: "auto-comment" });
         ctx.logger.info("Retained comment to memory", {
           commentId,
@@ -420,42 +541,23 @@ const plugin = definePlugin({
         const { query } = params as { query: string };
         const config = await getConfig(ctx);
 
-        // Read userId cached by agent.run.started for consistent bank derivation
-        let userId: string | undefined;
-        if (config.bankGranularity?.includes("user")) {
-          const cachedUserId = await ctx.state.get({
-            scopeKind: "run",
-            scopeId: runCtx.runId,
-            stateKey: "user-id",
-          });
-          if (cachedUserId && typeof cachedUserId === "string") userId = cachedUserId;
-        }
+        const attribution = await readRunAttribution(ctx, runCtx);
+        const userId = config.bankGranularity?.includes("user") ? attribution?.userId : undefined;
 
         const bankId = deriveBankId(
           { companyId: runCtx.companyId, agentId: runCtx.agentId, userId },
           config
         );
 
-        // Reuse the run-start recall only when the agent asks the same query;
-        // any other query must hit Hindsight, otherwise mid-run lookups would
-        // always get the issue-level memories back.
-        const cached = await ctx.state.get({
-          scopeKind: "run",
-          scopeId: runCtx.runId,
-          stateKey: "recalled-memories",
-        });
-        const cachedQuery = await ctx.state.get({
-          scopeKind: "run",
-          scopeId: runCtx.runId,
-          stateKey: "recalled-query",
-        });
+        // A matching query alone does not identify a memory store: bind the
+        // cache to the trusted principal, task/user, bank and backend identity.
+        const cached = attribution?.recall;
         if (
           cached &&
-          typeof cached === "string" &&
-          typeof cachedQuery === "string" &&
-          cachedQuery.trim() === query.trim()
+          cached.query.trim() === query.trim() &&
+          cached.scope === recallScope(config, bankId, attribution)
         ) {
-          return { content: cached };
+          return { content: cached.memories };
         }
 
         // Live recall fallback
@@ -467,7 +569,7 @@ const plugin = definePlugin({
             config.requestTimeoutMs
           );
           const response = await client.recall(bankId, query, config.recallBudget ?? "mid");
-          const memories = formatMemories(response.results);
+          const memories = formatScopedMemories(response.results, bankId);
           return { content: memories || "No relevant memories found." };
         } catch (err) {
           return { content: `Memory recall failed: ${String(err)}` };
@@ -484,31 +586,54 @@ const plugin = definePlugin({
         displayName: "Save to Memory",
         description:
           "Store important facts, decisions, or outcomes in Hindsight long-term memory for future runs.",
-        parametersSchema: {
-          type: "object",
-          required: ["content"],
-          properties: {
-            content: {
-              type: "string",
-              description: "The content to store in memory",
-            },
-          },
-        },
+        parametersSchema: retainParametersSchema,
       },
       async (params: unknown, runCtx: ToolRunContext) => {
-        const { content } = params as { content: string };
+        const raw = (params ?? {}) as {
+          content?: unknown;
+          observedAt?: unknown;
+          validUntil?: unknown;
+          supersedes?: unknown;
+        };
+        const { content } = raw;
+        // Tool callers often send null for an annotation they do not have; that
+        // means "absent". A present-but-blank or malformed claim stays rejected.
+        const optional = (value: unknown): unknown => (value === null ? undefined : value);
+        const observedAt = optional(raw.observedAt);
+        const validUntil = optional(raw.validUntil);
+        const supersedes = optional(raw.supersedes);
+        if (typeof content !== "string" || !content.trim()) {
+          return {
+            content: "Failed to save memory: content must be a non-empty string.",
+            error: "invalid-content",
+          };
+        }
+        const observation = formatTimestamp(observedAt);
+        const validity = formatTimestamp(validUntil);
+        if (
+          (observedAt !== undefined && observation === "unknown") ||
+          (validUntil !== undefined && validity === "unknown")
+        ) {
+          return {
+            content:
+              "Failed to save memory: invalid observedAt or validUntil; use ISO 8601 with an explicit timezone.",
+            error: "invalid-timestamp",
+          };
+        }
+        if (
+          supersedes !== undefined &&
+          (typeof supersedes !== "string" || !supersedes.trim() || supersedes.length > 512)
+        ) {
+          return {
+            content:
+              "Failed to save memory: invalid supersedes reference (1-512 characters required).",
+            error: "invalid-supersedes",
+          };
+        }
         const config = await getConfig(ctx);
 
-        // Read userId cached by agent.run.started for consistent bank derivation
-        let userId: string | undefined;
-        if (config.bankGranularity?.includes("user")) {
-          const cached = await ctx.state.get({
-            scopeKind: "run",
-            scopeId: runCtx.runId,
-            stateKey: "user-id",
-          });
-          if (cached && typeof cached === "string") userId = cached;
-        }
+        const attribution = await readRunAttribution(ctx, runCtx);
+        const userId = config.bankGranularity?.includes("user") ? attribution?.userId : undefined;
 
         const bankId = deriveBankId(
           { companyId: runCtx.companyId, agentId: runCtx.agentId, userId },
@@ -537,13 +662,58 @@ const plugin = definePlugin({
             apiKey,
             config.requestTimeoutMs
           );
-          await client.retain(bankId, content, undefined, {
-            agentId: runCtx.agentId,
-            companyId: runCtx.companyId,
-            runId: runCtx.runId,
-            ...toAssessmentMetadata(assessment),
-          });
+          const sourceId = randomUUID();
+          await client.retain(
+            bankId,
+            content,
+            `paperclip-explicit-${sourceId}`,
+            {
+              agentId: runCtx.agentId,
+              companyId: runCtx.companyId,
+              runId: runCtx.runId,
+              issueId: attribution?.issueId ?? "unknown",
+              "paperclip.provenance.source_type": "explicit_retain",
+              "paperclip.provenance.source_id": sourceId,
+              "paperclip.provenance.source_ref": `paperclip:run:${encodeURIComponent(runCtx.companyId)}:${encodeURIComponent(runCtx.agentId)}:${encodeURIComponent(runCtx.runId)}:memory:${sourceId}`,
+              "paperclip.provenance.recorded_at": new Date().toISOString(),
+              "paperclip.provenance.role": "agent",
+              ...(observedAt !== undefined
+                ? { "paperclip.provenance.observed_at": observation }
+                : {}),
+              ...(validUntil !== undefined ? { "paperclip.provenance.valid_until": validity } : {}),
+              ...(typeof supersedes === "string"
+                ? { "paperclip.provenance.supersedes": supersedes }
+                : {}),
+              ...toAssessmentMetadata(assessment),
+            },
+            observation === "unknown" ? "unset" : observation
+          );
           await safeMetric(ctx, "write_assessment.retain_accepted", 1, { path: "explicit-tool" });
+          // An accepted write can add newer validity/supersession evidence.
+          // Never serve the earlier run-start result after this operation.
+          try {
+            const current = await readRunAttribution(ctx, runCtx);
+            if (current) {
+              await ctx.state.set(
+                { scopeKind: "run", scopeId: runCtx.runId, stateKey: "memory-attribution" },
+                { ...current, recall: undefined }
+              );
+              await ctx.state.set(
+                { scopeKind: "run", scopeId: runCtx.runId, stateKey: "recalled-memories" },
+                null
+              );
+            }
+          } catch {
+            // Retention was already accepted; a cache outage is not a failed
+            // write, and must not cause the caller to resubmit raw history.
+            ctx.logger.warn("Memory accepted but recall cache invalidation failed", {
+              runId: runCtx.runId,
+            });
+            return {
+              content:
+                "Memory saved, but cached context invalidation failed. Use a different recall query for a fresh read.",
+            };
+          }
           return { content: "Memory saved." };
         } catch (err) {
           await safeMetric(ctx, "write_assessment.retain_failed", 1, { path: "explicit-tool" });

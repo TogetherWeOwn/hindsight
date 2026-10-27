@@ -62,7 +62,25 @@ Agents can call these tools directly during a run:
 
 **`hindsight_recall(query)`** — search memory for relevant context. Called automatically at run start; agents can also call it mid-run for targeted queries. The run-start result is reused only when the agent asks the same query; any other query triggers a live recall.
 
-**`hindsight_retain(content)`** — store a fact or decision immediately, without waiting for run end.
+**`hindsight_retain(content, observedAt?, validUntil?, supersedes?)`** — submit the full original fact or decision for asynchronous retention, without waiting for run end. Optional `observedAt` supplies a known observation time; `validUntil` and `supersedes` attach unverified claims to a new, independent source document. Both times require valid ISO 8601 instants with explicit timezones. Invalid supplied annotations fail before submission instead of silently substituting now; omitting them keeps legacy content-only calls valid. `supersedes` is a reference (1–512 characters), never an instruction to delete or replace the previous document.
+
+## Memory provenance, time and scope
+
+Recall preserves legacy text-only evidence and adds a JSON-encoded trust envelope for each result:
+
+- Native memory/document identities, event interval (`occurred_start` / `occurred_end`) and mention time (`mentioned_at`). Missing, malformed or timezone-ambiguous values are explicitly `unknown`; mention time is not capture time.
+- Source reference, capture time and company/agent/task/run/source-speaker attribution from `paperclip.provenance.*` and the existing identity metadata. Speaker role means `agent`, `user` or `system`, not an organizational job role or a permission.
+- `validity_status` and `supersession_status` stay `unknown`: Hindsight's native recall contract does not establish either. A writer's `valid_until` or `supersedes` annotation is displayed as an **unverified claim**, never proof of current authority.
+
+Text and attribution are JSON-quoted to keep multiline content from forging another envelope line. This is structural encoding, **not** prompt-injection enforcement: recalled content and source metadata remain untrusted historical evidence, not instructions, approvals or authorization.
+
+Automatic retention fetches the complete comment and its author/timestamps from the company-scoped host API. A payload snippet cannot replace the full source. If that read fails, the plugin logs the failure instead of storing a snippet as a complete episode. The plugin does not add a retry scheduler; full capture still depends on a successful host read/event delivery.
+
+Comment document IDs hash company, task, comment identity, the **full raw body** and the host's comment `updatedAt` (the source revision clock; capture time is excluded). Redelivering the same version reuses its ID; editing the source, or reverting it to earlier text with a newer `updatedAt`, creates a new document without deleting or overwriting the old version. Distinct comments with identical text remain distinct. Explicit retains get unique source/document IDs even for identical content captured in the same millisecond. Existing documents are not migrated, deleted or rewritten.
+
+Both writers keep the original body unchanged and attach string-valued metadata under `paperclip.provenance.*`: `source_type`, `source_id`, `source_ref`, `recorded_at`, `role`; automatic comments additionally include `source_created_at`, `source_updated_at` and speaker identities. Source references are stable `paperclip:comment:` / `paperclip:run:` URIs identifying the company-scoped source, not public web URLs. Capture time is distinct from source time. When observation time is unavailable, the native retain `timestamp` is `"unset"`, not an omitted value that the backend would interpret as now.
+
+Bank selection is unchanged. Recall does **not** add task/role tag filters: useful cross-task evidence remains visible. Shared/static or cross-company banks share according to their configured backend access; attribution metadata and tags are **not an authorization boundary**. Use backend tenancy/access controls and the appropriate bank granularity for isolation. The run cache binds the formatted evidence to trusted company/agent/task/user context, selected bank, backend URL, secret-reference identity and recall budget. A scope change requires a fresh read; failure never returns old scoped evidence or echoes raw backend error bodies. No resolved credential is cached.
 
 ## How It Works
 
