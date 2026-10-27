@@ -589,12 +589,19 @@ const plugin = definePlugin({
         parametersSchema: retainParametersSchema,
       },
       async (params: unknown, runCtx: ToolRunContext) => {
-        const { content, observedAt, validUntil, supersedes } = (params ?? {}) as {
+        const raw = (params ?? {}) as {
           content?: unknown;
           observedAt?: unknown;
           validUntil?: unknown;
           supersedes?: unknown;
         };
+        const { content } = raw;
+        // Tool callers often send null for an annotation they do not have; that
+        // means "absent". A present-but-blank or malformed claim stays rejected.
+        const optional = (value: unknown): unknown => (value === null ? undefined : value);
+        const observedAt = optional(raw.observedAt);
+        const validUntil = optional(raw.validUntil);
+        const supersedes = optional(raw.supersedes);
         if (typeof content !== "string" || !content.trim()) {
           return {
             content: "Failed to save memory: content must be a non-empty string.",
