@@ -1,5 +1,31 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
+// Discovery and worker dispatch must expose the same annotation contract.
+export const retainParametersSchema = {
+  type: "object",
+  required: ["content"],
+  properties: {
+    content: { type: "string", description: "The full original content to store in memory" },
+    observedAt: {
+      type: "string",
+      description:
+        "Known observation time as ISO 8601 with timezone. Omit when unknown; not capture time.",
+    },
+    validUntil: {
+      type: "string",
+      description:
+        "Unverified claimed validity end as ISO 8601 with timezone; does not establish validity.",
+    },
+    supersedes: {
+      type: "string",
+      minLength: 1,
+      maxLength: 512,
+      description:
+        "Unverified reference to an earlier source document. Does not delete or replace it.",
+    },
+  },
+};
+
 const manifest: PaperclipPluginManifestV1 = {
   id: "paperclip-plugin-hindsight",
   apiVersion: 1,
@@ -129,16 +155,7 @@ const manifest: PaperclipPluginManifestV1 = {
       displayName: "Save to Memory",
       description:
         "Store important facts, decisions, or outcomes in Hindsight long-term memory for future runs.",
-      parametersSchema: {
-        type: "object",
-        required: ["content"],
-        properties: {
-          content: {
-            type: "string",
-            description: "The content to store in memory",
-          },
-        },
-      },
+      parametersSchema: retainParametersSchema,
     },
   ],
 };
