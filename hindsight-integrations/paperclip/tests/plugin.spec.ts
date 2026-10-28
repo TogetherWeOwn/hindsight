@@ -590,6 +590,36 @@ describe("hindsight_recall tool", () => {
     expect(fetchMock).toHaveBeenCalledTimes(callsBefore);
   });
 
+  it("returns user-scoped run-start memories for an empty query without another API call", async () => {
+    const harness = buildHarness({
+      ...DEFAULT_CONFIG,
+      bankGranularity: ["company", "agent", "user"],
+    });
+    await setupPlugin(harness);
+    const issue = await seedIssue(harness, { companyId: "co-1", title: "Update UI" });
+    (issue as Record<string, unknown>).originId = "slack::alice@acme.com";
+    const fetchMock = mockFetch([
+      { url: /recall/, body: { results: [{ text: "Alice prefers dark mode" }] } },
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+    await harness.emit(
+      "agent.run.started",
+      { agentId: "ag-1", runId: "run-1", issueId: issue.id },
+      { companyId: "co-1" }
+    );
+    expect(fetchMock.mock.calls[0]?.[0]).toContain(
+      encodeURIComponent("paperclip::co-1::ag-1::user::alice@acme.com")
+    );
+    const callsBefore = fetchMock.mock.calls.length;
+    const result = await harness.executeTool(
+      "hindsight_recall",
+      { query: " " },
+      { agentId: "ag-1", runId: "run-1", companyId: "co-1" }
+    );
+    expect(result).toMatchObject({ content: expect.stringContaining("Alice prefers dark mode") });
+    expect(fetchMock).toHaveBeenCalledTimes(callsBefore);
+  });
+
   it.each([
     { agentId: "ag-2", runId: "run-1", companyId: "co-1" },
     { agentId: "ag-1", runId: "run-1", companyId: "co-2" },

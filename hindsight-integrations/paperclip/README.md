@@ -60,7 +60,7 @@ paperclip::{companyId}::{agentId}::user::{userId}  ← user granularity (per-use
 
 Agents can call these tools directly during a run:
 
-**`hindsight_recall(query)`** — search memory for relevant context. Called automatically at run start; agents can also call it mid-run for targeted queries. The run-start result is reused only when the agent asks the same query; any other query triggers a live recall.
+**`hindsight_recall(query)`** — search memory for relevant context. Called automatically at run start; agents can also call it mid-run for targeted queries. A matching query reuses the run-start result if its scope is still valid; a different nonempty query triggers a live recall. An empty query returns available, scope-valid run-start memories and guidance, or guidance alone if none are available. A caller enforcing the tool schema may reject a missing `query` before it reaches the handler; use a blank string for an empty query.
 
 **`hindsight_retain(content, observedAt?, validUntil?, supersedes?)`** — submit the full original fact or decision for asynchronous retention, without waiting for run end. Optional `observedAt` supplies a known observation time; `validUntil` and `supersedes` attach unverified claims to a new, independent source document. Both times require valid ISO 8601 instants with explicit timezones. Invalid supplied annotations fail before submission instead of silently substituting now; omitting them keeps legacy content-only calls valid. `supersedes` is a reference (1–512 characters), never an instruction to delete or replace the previous document.
 
@@ -90,7 +90,8 @@ agent.run.started
        └─ recall(issueTitle + description) → cached in plugin state for the run
 
 agent running…
-  ├─ hindsight_recall(query) → cached context if query matches run start, otherwise live recall
+  ├─ hindsight_recall(query) → scope-valid cache for matching query; other nonempty query → live recall
+  │                            empty query → scope-valid run-start memories or guidance
   └─ hindsight_retain(content) → stores immediately
 
 issue.comment.created
