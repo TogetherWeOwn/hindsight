@@ -210,6 +210,72 @@ describe("agent.run.started", () => {
     vi.unstubAllGlobals();
   });
 
+  it("handles reused runs and absent users with NOT NULL state", async () => {
+    const harness = buildHarness({
+      ...DEFAULT_CONFIG,
+      bankGranularity: ["company", "agent", "user"],
+    });
+    const set = harness.ctx.state.set.bind(harness.ctx.state);
+    vi.spyOn(harness.ctx.state, "set").mockImplementation(async (key, value) => {
+      if (value == null) throw new Error("plugin_state.value_json violates NOT NULL");
+      await set(key, value);
+    });
+    await setupPlugin(harness);
+    const withUser = await seedIssue(harness, { companyId: "co-1", title: "first" });
+    Object.assign(withUser, { originId: "slack::alice@example.com" });
+    const noUser = await seedIssue(harness, { companyId: "co-1", title: "second" });
+    const key = (stateKey: string) => ({ scopeKind: "run" as const, scopeId: "reused", stateKey });
+    const emit = (issueId?: string) =>
+      harness.emit(
+        "agent.run.started",
+        { agentId: "ag-1", runId: "reused", issueId },
+        { companyId: "co-1" }
+      );
+
+    await emit(withUser.id);
+    expect(harness.getState(key("user-id"))).toBe("alice@example.com");
+    expect(harness.getState(key("recalled-memories"))).toContain("TypeScript");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await emit(noUser.id);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(harness.getState(key("user-id"))).toBeUndefined();
+    expect(harness.getState(key("memory-attribution"))).toMatchObject({ issueId: noUser.id });
+    expect(fetchMock.mock.calls.at(-1)?.[0]).not.toContain("alice");
+    await emit();
+    expect(harness.getState(key("user-id"))).toBeUndefined();
+    expect(harness.getState(key("memory-attribution"))).toBeUndefined();
+    expect(harness.getState(key("recalled-memories"))).toBeUndefined();
+  });
+
+  it("invalidates recalled state after a successful retain with NOT NULL state", async () => {
+    const harness = buildHarness();
+    const set = harness.ctx.state.set.bind(harness.ctx.state);
+    vi.spyOn(harness.ctx.state, "set").mockImplementation(async (key, value) => {
+      if (value == null) throw new Error("plugin_state.value_json violates NOT NULL");
+      await set(key, value);
+    });
+    vi.stubGlobal(
+      "fetch",
+      mockFetch([
+        { url: /recall/, body: { results: [{ text: "Old evidence" }] } },
+        { url: /memories/, body: {} },
+      ])
+    );
+    await setupPlugin(harness);
+    const issue = await seedIssue(harness, { companyId: "co-1", title: "Task" });
+    const run = { agentId: "ag-1", runId: "run-retain", companyId: "co-1" };
+    await harness.emit(
+      "agent.run.started",
+      { ...run, issueId: issue.id },
+      { companyId: run.companyId }
+    );
+    const result = await harness.executeTool("hindsight_retain", { content: "New evidence" }, run);
+    expect(result.content).toBe("Memory saved.");
+    expect(
+      harness.getState({ scopeKind: "run", scopeId: run.runId, stateKey: "recalled-memories" })
+    ).toBeUndefined();
+  });
+
   it("fetches the issue, calls recall, and caches memories in plugin state", async () => {
     const harness = buildHarness();
     await setupPlugin(harness);
@@ -477,6 +543,23 @@ describe("hindsight_recall tool", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
   });
+
+  it.each([undefined, null, {}, { query: "" }, { query: "   " }, { query: 7 }])(
+    "returns guidance for empty or invalid recall input %s without a network call",
+    async (params) => {
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+      const harness = buildHarness();
+      await setupPlugin(harness);
+      const result = await harness.executeTool("hindsight_recall", params, {
+        agentId: "ag-1",
+        runId: "run-1",
+        companyId: "co-1",
+      });
+      expect((result as { content: string }).content).toContain('"query"');
+      expect(fetchMock).not.toHaveBeenCalled();
+    }
+  );
 
   it("returns cached memories from run start without additional API call for the same query", async () => {
     const harness = buildHarness();
