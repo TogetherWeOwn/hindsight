@@ -288,15 +288,9 @@ const plugin = definePlugin({
       if (!companyId) return;
       // Reused run IDs must not keep the prior issue/user or recalled evidence
       // when the new host association is absent, unreadable or has no user.
-      await ctx.state.set(
-        { scopeKind: "run", scopeId: runId, stateKey: "memory-attribution" },
-        null
-      );
-      await ctx.state.set({ scopeKind: "run", scopeId: runId, stateKey: "user-id" }, null);
-      await ctx.state.set(
-        { scopeKind: "run", scopeId: runId, stateKey: "recalled-memories" },
-        null
-      );
+      await ctx.state.delete({ scopeKind: "run", scopeId: runId, stateKey: "memory-attribution" });
+      await ctx.state.delete({ scopeKind: "run", scopeId: runId, stateKey: "user-id" });
+      await ctx.state.delete({ scopeKind: "run", scopeId: runId, stateKey: "recalled-memories" });
       if (!issueId) return;
 
       let issue;
@@ -326,11 +320,10 @@ const plugin = definePlugin({
         { scopeKind: "run", scopeId: runId, stateKey: "memory-attribution" },
         attribution
       );
-      // Keep the host-visible scalar current, including explicitly absent users.
-      await ctx.state.set(
-        { scopeKind: "run", scopeId: runId, stateKey: "user-id" },
-        userId ?? null
-      );
+      // The prior scalar was deleted above; only store a user when one exists.
+      if (userId) {
+        await ctx.state.set({ scopeKind: "run", scopeId: runId, stateKey: "user-id" }, userId);
+      }
       if (!query.trim()) return;
 
       try {
@@ -538,7 +531,14 @@ const plugin = definePlugin({
         },
       },
       async (params: unknown, runCtx: ToolRunContext) => {
-        const { query } = params as { query: string };
+        const rawQuery = (params as { query?: unknown } | null | undefined)?.query;
+        if (typeof rawQuery !== "string" || !rawQuery.trim()) {
+          return {
+            content:
+              'hindsight_recall needs a "query" string describing what to look up (for example the task title). Memory is available; call it again with a query.',
+          };
+        }
+        const query = rawQuery.trim();
         const config = await getConfig(ctx);
 
         const attribution = await readRunAttribution(ctx, runCtx);
@@ -698,10 +698,11 @@ const plugin = definePlugin({
                 { scopeKind: "run", scopeId: runCtx.runId, stateKey: "memory-attribution" },
                 { ...current, recall: undefined }
               );
-              await ctx.state.set(
-                { scopeKind: "run", scopeId: runCtx.runId, stateKey: "recalled-memories" },
-                null
-              );
+              await ctx.state.delete({
+                scopeKind: "run",
+                scopeId: runCtx.runId,
+                stateKey: "recalled-memories",
+              });
             }
           } catch {
             // Retention was already accepted; a cache outage is not a failed
