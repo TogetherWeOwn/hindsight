@@ -556,10 +556,107 @@ describe("hindsight_recall tool", () => {
         runId: "run-1",
         companyId: "co-1",
       });
+      expect(result).toMatchObject({ error: "invalid-query" });
       expect((result as { content: string }).content).toContain('"query"');
       expect(fetchMock).not.toHaveBeenCalled();
     }
   );
+
+  it("returns this run's recalled memories for an empty query without another API call", async () => {
+    const harness = buildHarness();
+    await setupPlugin(harness);
+    const issue = await seedIssue(harness, { companyId: "co-1", title: "Update UI" });
+    const fetchMock = mockFetch([
+      { url: /recall/, body: { results: [{ text: "User prefers dark mode" }] } },
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+    await harness.emit(
+      "agent.run.started",
+      { agentId: "ag-1", runId: "run-1", issueId: issue.id },
+      { companyId: "co-1" }
+    );
+    const callsBefore = fetchMock.mock.calls.length;
+    const result = await harness.executeTool(
+      "hindsight_recall",
+      { query: "  " },
+      {
+        agentId: "ag-1",
+        runId: "run-1",
+        companyId: "co-1",
+      }
+    );
+    expect(result).toMatchObject({ content: expect.stringContaining("User prefers dark mode") });
+    expect((result as { content: string }).content).toContain('"query"');
+    expect(fetchMock).toHaveBeenCalledTimes(callsBefore);
+  });
+
+  it.each([
+    { agentId: "ag-2", runId: "run-1", companyId: "co-1" },
+    { agentId: "ag-1", runId: "run-1", companyId: "co-2" },
+    { agentId: "ag-1", runId: "run-2", companyId: "co-1" },
+  ])("does not expose another run or principal's recalled memories: %s", async (run) => {
+    const harness = buildHarness();
+    await setupPlugin(harness);
+    const issue = await seedIssue(harness, { companyId: "co-1", title: "Update UI" });
+    vi.stubGlobal(
+      "fetch",
+      mockFetch([{ url: /recall/, body: { results: [{ text: "User prefers dark mode" }] } }])
+    );
+    await harness.emit(
+      "agent.run.started",
+      { agentId: "ag-1", runId: "run-1", issueId: issue.id },
+      { companyId: "co-1" }
+    );
+    const result = await harness.executeTool("hindsight_recall", {}, run);
+    expect(result).toMatchObject({ error: "invalid-query" });
+    expect((result as { content: string }).content).not.toContain("dark mode");
+  });
+
+  it("does not return run-start memories after the configured backend changes", async () => {
+    const harness = buildHarness();
+    await setupPlugin(harness);
+    const issue = await seedIssue(harness, { companyId: "co-1", title: "Update UI" });
+    vi.stubGlobal(
+      "fetch",
+      mockFetch([{ url: /recall/, body: { results: [{ text: "User prefers dark mode" }] } }])
+    );
+    await harness.emit(
+      "agent.run.started",
+      { agentId: "ag-1", runId: "run-1", issueId: issue.id },
+      { companyId: "co-1" }
+    );
+    harness.setConfig({ ...DEFAULT_CONFIG, hindsightApiUrl: "http://other-backend:8888" });
+    const result = await harness.executeTool(
+      "hindsight_recall",
+      {},
+      {
+        agentId: "ag-1",
+        runId: "run-1",
+        companyId: "co-1",
+      }
+    );
+    expect(result).toMatchObject({ error: "invalid-query" });
+    expect((result as { content: string }).content).not.toContain("dark mode");
+  });
+
+  it("returns guidance when the run state is unavailable", async () => {
+    const harness = buildHarness();
+    await setupPlugin(harness);
+    vi.spyOn(harness.ctx.state, "get").mockRejectedValue(new Error("state unavailable"));
+    const result = await harness.executeTool(
+      "hindsight_recall",
+      {},
+      {
+        agentId: "ag-1",
+        runId: "run-1",
+        companyId: "co-1",
+      }
+    );
+    expect(result).toMatchObject({
+      error: "invalid-query",
+      content: expect.stringContaining('"query"'),
+    });
+  });
 
   it("returns cached memories from run start without additional API call for the same query", async () => {
     const harness = buildHarness();

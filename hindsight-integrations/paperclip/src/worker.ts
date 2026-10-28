@@ -533,7 +533,29 @@ const plugin = definePlugin({
       async (params: unknown, runCtx: ToolRunContext) => {
         const rawQuery = (params as { query?: unknown } | null | undefined)?.query;
         if (typeof rawQuery !== "string" || !rawQuery.trim()) {
+          try {
+            const attribution = await readRunAttribution(ctx, runCtx);
+            if (attribution?.recall?.memories) {
+              const config = await getConfig(ctx);
+              const userId = config.bankGranularity?.includes("user")
+                ? attribution.userId
+                : undefined;
+              const bankId = deriveBankId(
+                { companyId: runCtx.companyId, agentId: runCtx.agentId, userId },
+                config
+              );
+              // Keep the same backend and principal boundary as the normal cache path.
+              if (attribution.recall.scope === recallScope(config, bankId, attribution)) {
+                return {
+                  content: `No query was given, so these are the memories already recalled for this run. Call hindsight_recall again with a "query" string to search for something specific.\n\n${attribution.recall.memories}`,
+                };
+              }
+            }
+          } catch {
+            // Guidance is still useful when run state or configuration cannot be read.
+          }
           return {
+            error: "invalid-query",
             content:
               'hindsight_recall needs a "query" string describing what to look up (for example the task title). Memory is available; call it again with a query.',
           };
