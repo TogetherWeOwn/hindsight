@@ -575,6 +575,13 @@ describe("hindsight_recall tool", () => {
       { agentId: "ag-1", runId: "run-1", issueId: issue.id },
       { companyId: "co-1" }
     );
+    const attribution = harness.getState({
+      scopeKind: "run",
+      scopeId: "run-1",
+      stateKey: "memory-attribution",
+    }) as { recall?: { memories?: string } };
+    const memories = attribution.recall?.memories;
+    expect(memories).toContain("User prefers dark mode");
     const callsBefore = fetchMock.mock.calls.length;
     const result = await harness.executeTool(
       "hindsight_recall",
@@ -585,8 +592,9 @@ describe("hindsight_recall tool", () => {
         companyId: "co-1",
       }
     );
-    expect(result).toMatchObject({ content: expect.stringContaining("User prefers dark mode") });
-    expect((result as { content: string }).content).toContain('"query"');
+    expect(result).toEqual({
+      content: `No query was given, so these are the memories already recalled for this run. Call hindsight_recall again with a "query" string to search for something specific.\n\n${memories}`,
+    });
     expect(fetchMock).toHaveBeenCalledTimes(callsBefore);
   });
 
@@ -610,13 +618,22 @@ describe("hindsight_recall tool", () => {
     expect(fetchMock.mock.calls[0]?.[0]).toContain(
       encodeURIComponent("paperclip::co-1::ag-1::user::alice@acme.com")
     );
+    const attribution = harness.getState({
+      scopeKind: "run",
+      scopeId: "run-1",
+      stateKey: "memory-attribution",
+    }) as { recall?: { memories?: string } };
+    const memories = attribution.recall?.memories;
+    expect(memories).toContain("Alice prefers dark mode");
     const callsBefore = fetchMock.mock.calls.length;
     const result = await harness.executeTool(
       "hindsight_recall",
       { query: " " },
       { agentId: "ag-1", runId: "run-1", companyId: "co-1" }
     );
-    expect(result).toMatchObject({ content: expect.stringContaining("Alice prefers dark mode") });
+    expect(result).toEqual({
+      content: `No query was given, so these are the memories already recalled for this run. Call hindsight_recall again with a "query" string to search for something specific.\n\n${memories}`,
+    });
     expect(fetchMock).toHaveBeenCalledTimes(callsBefore);
   });
 
