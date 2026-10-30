@@ -107,6 +107,19 @@ function recallScope(config: PluginConfig, bankId: string, attribution?: RunAttr
     .digest("hex");
 }
 
+function cachedRecallFor(run: ToolRunContext, config: PluginConfig, attribution?: RunAttribution) {
+  const userId = config.bankGranularity?.includes("user") ? attribution?.userId : undefined;
+  const bankId = deriveBankId({ companyId: run.companyId, agentId: run.agentId, userId }, config);
+  const cached = attribution?.recall;
+  // A matching query alone does not identify a memory store: bind the cache to
+  // the trusted principal, task/user, bank and backend identity.
+  return {
+    bankId,
+    cached:
+      cached && cached.scope === recallScope(config, bankId, attribution) ? cached : undefined,
+  };
+}
+
 function formatScopedMemories(
   memories: Parameters<typeof formatMemories>[0],
   bankId: string
@@ -533,7 +546,22 @@ const plugin = definePlugin({
       async (params: unknown, runCtx: ToolRunContext) => {
         const rawQuery = (params as { query?: unknown } | null | undefined)?.query;
         if (typeof rawQuery !== "string" || !rawQuery.trim()) {
+          try {
+            const attribution = await readRunAttribution(ctx, runCtx);
+            if (attribution?.recall?.memories) {
+              const config = await getConfig(ctx);
+              const { cached } = cachedRecallFor(runCtx, config, attribution);
+              if (cached) {
+                return {
+                  content: `No query was given, so these are the memories already recalled for this run. Call hindsight_recall again with a "query" string to search for something specific.\n\n${cached.memories}`,
+                };
+              }
+            }
+          } catch {
+            // Guidance is still useful when run state or configuration cannot be read.
+          }
           return {
+            error: "invalid-query",
             content:
               'hindsight_recall needs a "query" string describing what to look up (for example the task title). Memory is available; call it again with a query.',
           };
@@ -542,21 +570,8 @@ const plugin = definePlugin({
         const config = await getConfig(ctx);
 
         const attribution = await readRunAttribution(ctx, runCtx);
-        const userId = config.bankGranularity?.includes("user") ? attribution?.userId : undefined;
-
-        const bankId = deriveBankId(
-          { companyId: runCtx.companyId, agentId: runCtx.agentId, userId },
-          config
-        );
-
-        // A matching query alone does not identify a memory store: bind the
-        // cache to the trusted principal, task/user, bank and backend identity.
-        const cached = attribution?.recall;
-        if (
-          cached &&
-          cached.query.trim() === query.trim() &&
-          cached.scope === recallScope(config, bankId, attribution)
-        ) {
+        const { bankId, cached } = cachedRecallFor(runCtx, config, attribution);
+        if (cached && cached.query.trim() === query.trim()) {
           return { content: cached.memories };
         }
 
