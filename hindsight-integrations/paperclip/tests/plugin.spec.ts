@@ -562,6 +562,50 @@ describe("hindsight_recall tool", () => {
     }
   );
 
+  it.each([
+    undefined,
+    null,
+    {},
+    { query: undefined },
+    { query: null },
+    { query: 7 },
+    { query: false },
+    { query: [] },
+    { query: ["Update UI"] },
+    { query: {} },
+  ])("rejects malformed recall input %j even with a populated run cache", async (params) => {
+    const harness = buildHarness();
+    await setupPlugin(harness);
+    const issue = await seedIssue(harness, { companyId: "co-1", title: "Update UI" });
+    const fetchMock = mockFetch([
+      { url: /recall/, body: { results: [{ text: "User prefers dark mode" }] } },
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+    await harness.emit(
+      "agent.run.started",
+      { agentId: "ag-1", runId: "run-1", issueId: issue.id },
+      { companyId: "co-1" }
+    );
+    const attribution = harness.getState({
+      scopeKind: "run",
+      scopeId: "run-1",
+      stateKey: "memory-attribution",
+    }) as { recall?: { memories?: string } };
+    expect(attribution.recall?.memories).toContain("User prefers dark mode");
+    const callsBefore = fetchMock.mock.calls.length;
+    const result = await harness.executeTool("hindsight_recall", params, {
+      agentId: "ag-1",
+      runId: "run-1",
+      companyId: "co-1",
+    });
+    expect(result).toEqual({
+      error: "invalid-query",
+      content:
+        'hindsight_recall needs a "query" string describing what to look up (for example the task title). Memory is available; call it again with a query.',
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(callsBefore);
+  });
+
   it.each(["", "  "])(
     "returns this run's recalled memories for query %j without another API call",
     async (query) => {
@@ -660,7 +704,7 @@ describe("hindsight_recall tool", () => {
       { agentId: "ag-1", runId: "run-1", issueId: issue.id },
       { companyId: "co-1" }
     );
-    const result = await harness.executeTool("hindsight_recall", {}, run);
+    const result = await harness.executeTool("hindsight_recall", { query: "" }, run);
     expect(result).toMatchObject({ error: "invalid-query" });
     expect((result as { content: string }).content).not.toContain("dark mode");
   });
@@ -681,7 +725,7 @@ describe("hindsight_recall tool", () => {
     harness.setConfig({ ...DEFAULT_CONFIG, hindsightApiUrl: "http://other-backend:8888" });
     const result = await harness.executeTool(
       "hindsight_recall",
-      {},
+      { query: "" },
       {
         agentId: "ag-1",
         runId: "run-1",
@@ -698,7 +742,7 @@ describe("hindsight_recall tool", () => {
     vi.spyOn(harness.ctx.state, "get").mockRejectedValue(new Error("state unavailable"));
     const result = await harness.executeTool(
       "hindsight_recall",
-      {},
+      { query: "" },
       {
         agentId: "ag-1",
         runId: "run-1",

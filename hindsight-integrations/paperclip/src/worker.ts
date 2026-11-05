@@ -548,7 +548,8 @@ const plugin = definePlugin({
         if (typeof rawQuery !== "string" || !rawQuery.trim()) {
           try {
             const attribution = await readRunAttribution(ctx, runCtx);
-            if (attribution?.recall?.memories) {
+            // Only blank strings may reuse the cache; omitted or malformed queries stay invalid.
+            if (typeof rawQuery === "string" && attribution?.recall?.memories) {
               const config = await getConfig(ctx);
               const { cached } = cachedRecallFor(runCtx, config, attribution);
               if (cached) {
