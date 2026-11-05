@@ -556,10 +556,204 @@ describe("hindsight_recall tool", () => {
         runId: "run-1",
         companyId: "co-1",
       });
+      expect(result).toMatchObject({ error: "invalid-query" });
       expect((result as { content: string }).content).toContain('"query"');
       expect(fetchMock).not.toHaveBeenCalled();
     }
   );
+
+  it.each([
+    undefined,
+    null,
+    {},
+    { query: undefined },
+    { query: null },
+    { query: 7 },
+    { query: false },
+    { query: [] },
+    { query: ["Update UI"] },
+    { query: {} },
+  ])("rejects malformed recall input %j even with a populated run cache", async (params) => {
+    const harness = buildHarness();
+    await setupPlugin(harness);
+    const issue = await seedIssue(harness, { companyId: "co-1", title: "Update UI" });
+    const fetchMock = mockFetch([
+      { url: /recall/, body: { results: [{ text: "User prefers dark mode" }] } },
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+    await harness.emit(
+      "agent.run.started",
+      { agentId: "ag-1", runId: "run-1", issueId: issue.id },
+      { companyId: "co-1" }
+    );
+    const attribution = harness.getState({
+      scopeKind: "run",
+      scopeId: "run-1",
+      stateKey: "memory-attribution",
+    }) as { recall?: { memories?: string } };
+    expect(attribution.recall?.memories).toContain("User prefers dark mode");
+    const callsBefore = fetchMock.mock.calls.length;
+    const result = await harness.executeTool("hindsight_recall", params, {
+      agentId: "ag-1",
+      runId: "run-1",
+      companyId: "co-1",
+    });
+    expect(result).toEqual({
+      error: "invalid-query",
+      content:
+        'hindsight_recall needs a "query" string describing what to look up (for example the task title). Memory is available; call it again with a query.',
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(callsBefore);
+  });
+
+  it.each(["", "  "])(
+    "returns this run's recalled memories for query %j without another API call",
+    async (query) => {
+      const harness = buildHarness();
+      await setupPlugin(harness);
+      const issue = await seedIssue(harness, { companyId: "co-1", title: "Update UI" });
+      const fetchMock = mockFetch([
+        { url: /recall/, body: { results: [{ text: "User prefers dark mode" }] } },
+      ]);
+      vi.stubGlobal("fetch", fetchMock);
+      await harness.emit(
+        "agent.run.started",
+        { agentId: "ag-1", runId: "run-1", issueId: issue.id },
+        { companyId: "co-1" }
+      );
+      const attribution = harness.getState({
+        scopeKind: "run",
+        scopeId: "run-1",
+        stateKey: "memory-attribution",
+      }) as { recall?: { memories?: string } };
+      const memories = attribution.recall?.memories;
+      expect(memories).toContain("User prefers dark mode");
+      const callsBefore = fetchMock.mock.calls.length;
+      const result = await harness.executeTool(
+        "hindsight_recall",
+        { query },
+        {
+          agentId: "ag-1",
+          runId: "run-1",
+          companyId: "co-1",
+        }
+      );
+      expect(result).toEqual({
+        content: `No query was given, so these are the memories already recalled for this run. Call hindsight_recall again with a "query" string to search for something specific.\n\n${memories}`,
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(callsBefore);
+    }
+  );
+
+  it.each(["", " "])(
+    "returns user-scoped run-start memories for query %j without another API call",
+    async (query) => {
+      const harness = buildHarness({
+        ...DEFAULT_CONFIG,
+        bankGranularity: ["company", "agent", "user"],
+      });
+      await setupPlugin(harness);
+      const issue = await seedIssue(harness, { companyId: "co-1", title: "Update UI" });
+      (issue as Record<string, unknown>).originId = "slack::alice@acme.com";
+      const fetchMock = mockFetch([
+        { url: /recall/, body: { results: [{ text: "Alice prefers dark mode" }] } },
+      ]);
+      vi.stubGlobal("fetch", fetchMock);
+      await harness.emit(
+        "agent.run.started",
+        { agentId: "ag-1", runId: "run-1", issueId: issue.id },
+        { companyId: "co-1" }
+      );
+      expect(fetchMock.mock.calls[0]?.[0]).toContain(
+        encodeURIComponent("paperclip::co-1::ag-1::user::alice@acme.com")
+      );
+      const attribution = harness.getState({
+        scopeKind: "run",
+        scopeId: "run-1",
+        stateKey: "memory-attribution",
+      }) as { recall?: { memories?: string } };
+      const memories = attribution.recall?.memories;
+      expect(memories).toContain("Alice prefers dark mode");
+      const callsBefore = fetchMock.mock.calls.length;
+      const result = await harness.executeTool(
+        "hindsight_recall",
+        { query },
+        { agentId: "ag-1", runId: "run-1", companyId: "co-1" }
+      );
+      expect(result).toEqual({
+        content: `No query was given, so these are the memories already recalled for this run. Call hindsight_recall again with a "query" string to search for something specific.\n\n${memories}`,
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(callsBefore);
+    }
+  );
+
+  it.each([
+    { agentId: "ag-2", runId: "run-1", companyId: "co-1" },
+    { agentId: "ag-1", runId: "run-1", companyId: "co-2" },
+    { agentId: "ag-1", runId: "run-2", companyId: "co-1" },
+  ])("does not expose another run or principal's recalled memories: %s", async (run) => {
+    const harness = buildHarness();
+    await setupPlugin(harness);
+    const issue = await seedIssue(harness, { companyId: "co-1", title: "Update UI" });
+    vi.stubGlobal(
+      "fetch",
+      mockFetch([{ url: /recall/, body: { results: [{ text: "User prefers dark mode" }] } }])
+    );
+    await harness.emit(
+      "agent.run.started",
+      { agentId: "ag-1", runId: "run-1", issueId: issue.id },
+      { companyId: "co-1" }
+    );
+    const result = await harness.executeTool("hindsight_recall", { query: "" }, run);
+    expect(result).toMatchObject({ error: "invalid-query" });
+    expect((result as { content: string }).content).not.toContain("dark mode");
+  });
+
+  it("does not return run-start memories after the configured backend changes", async () => {
+    const harness = buildHarness();
+    await setupPlugin(harness);
+    const issue = await seedIssue(harness, { companyId: "co-1", title: "Update UI" });
+    vi.stubGlobal(
+      "fetch",
+      mockFetch([{ url: /recall/, body: { results: [{ text: "User prefers dark mode" }] } }])
+    );
+    await harness.emit(
+      "agent.run.started",
+      { agentId: "ag-1", runId: "run-1", issueId: issue.id },
+      { companyId: "co-1" }
+    );
+    harness.setConfig({ ...DEFAULT_CONFIG, hindsightApiUrl: "http://other-backend:8888" });
+    const result = await harness.executeTool(
+      "hindsight_recall",
+      { query: "" },
+      {
+        agentId: "ag-1",
+        runId: "run-1",
+        companyId: "co-1",
+      }
+    );
+    expect(result).toMatchObject({ error: "invalid-query" });
+    expect((result as { content: string }).content).not.toContain("dark mode");
+  });
+
+  it("returns guidance when the run state is unavailable", async () => {
+    const harness = buildHarness();
+    await setupPlugin(harness);
+    vi.spyOn(harness.ctx.state, "get").mockRejectedValue(new Error("state unavailable"));
+    const result = await harness.executeTool(
+      "hindsight_recall",
+      { query: "" },
+      {
+        agentId: "ag-1",
+        runId: "run-1",
+        companyId: "co-1",
+      }
+    );
+    expect(result).toMatchObject({
+      error: "invalid-query",
+      content: expect.stringContaining('"query"'),
+    });
+  });
 
   it("returns cached memories from run start without additional API call for the same query", async () => {
     const harness = buildHarness();
@@ -954,7 +1148,8 @@ describe("hindsightApiKeyRef", () => {
     // its own picker submits: "Configuration does not match the plugin's
     // instanceConfigSchema". The schema must admit the reference object too.
     const objectBranch = field?.oneOf?.find((branch) => branch.type === "object") as
-      { required?: string[]; properties?: Record<string, unknown> } | undefined;
+      | { required?: string[]; properties?: Record<string, unknown> }
+      | undefined;
     expect(objectBranch).toBeDefined();
     expect(objectBranch?.required).toEqual(["type", "secretId"]);
     expect(field?.oneOf?.some((branch) => branch.type === "string")).toBe(true);
