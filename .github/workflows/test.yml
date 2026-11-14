@@ -5587,7 +5587,6 @@ jobs:
           echo "  ./scripts/hooks/lint.sh"
           echo ""
           git diff --stat
-          git --no-pager diff --no-ext-diff --no-color -- hindsight-integrations/paperclip/tests/plugin.spec.ts
           exit 1
         fi
         echo "✓ All generated files are up to date"
