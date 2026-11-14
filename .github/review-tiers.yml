@@ -7,6 +7,8 @@
 # tenant isolation or personal data; SQL, schema or migrations; dependencies and
 # lockfiles (including dev dependencies); CI or workflows; weakened assertions,
 # deleted tests or snapshots, or lowered gates. These changes are sensitive.
+# Low documentation paths cover prose copy only: executable content, security
+# guidance, agent instructions or other non-prose changes are sensitive.
 # Test allowlists, if added, apply only to additive unit tests.
 version: 1
 default_tier: sensitive
