@@ -19,7 +19,8 @@ from one place, so we don't spawn a separate ``asyncio`` task per concern:
   per-model schedule lives in the cron expression; this loop only decides when to
   *check*.
 
-The loop wakes on a short fixed tick and runs each job when its own
+The loop wakes at most a minute apart, or sooner for shorter configured intervals,
+and runs each job when its own
 ``last_run + interval`` is due (run-at-start, then on interval), so adding jobs
 with different cadences doesn't burst CPU. Cross-tenant discovery goes through
 server-side PL/pgSQL routines (``schemas_with_expired_rows`` and
@@ -180,9 +181,21 @@ class MaintenanceLoop:
             except Exception:
                 logger.exception("Maintenance tick failed")
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=_TICK_SECONDS)
+                await asyncio.wait_for(self._stop.wait(), timeout=self._tick_interval())
             except asyncio.TimeoutError:
                 pass
+
+    @staticmethod
+    def _tick_interval() -> int:
+        cfg = get_config()
+        intervals = [cfg.consolidation_reconcile_interval_seconds, cfg.mental_model_refresh_tick_seconds]
+        if cfg.audit_log_retention_days > 0 or (cfg.llm_trace_enabled and cfg.llm_trace_retention_days > 0):
+            intervals.append(cfg.retention_sweep_interval_seconds)
+        if cfg.operation_retention_days > 0:
+            intervals.append(cfg.operation_cleanup_interval_seconds)
+        # A fixed 60-second sleep silently rounded shorter configured intervals up
+        # to a minute. Ignore disabled jobs so zero cannot create a busy loop.
+        return min([_TICK_SECONDS, *(interval for interval in intervals if interval > 0)])
 
     async def _wait_start_jitter(self) -> bool:
         """Delay the first tick by a random offset. Returns False if stopped while waiting.

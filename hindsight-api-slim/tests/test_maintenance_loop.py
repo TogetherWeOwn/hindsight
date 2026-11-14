@@ -53,6 +53,52 @@ def test_is_due_runs_at_start_then_waits_interval():
     assert loop._is_due("job", 3600) is True
 
 
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({}, 60),
+        ({"consolidation_reconcile_interval_seconds": 5}, 5),
+        ({"mental_model_refresh_tick_seconds": 7}, 7),
+        ({"retention_sweep_interval_seconds": 3, "audit_log_retention_days": 1}, 3),
+        ({"retention_sweep_interval_seconds": 3, "llm_trace_enabled": True, "llm_trace_retention_days": 1}, 3),
+        ({"operation_cleanup_interval_seconds": 4, "operation_retention_days": 1}, 4),
+        ({"retention_sweep_interval_seconds": 1, "operation_cleanup_interval_seconds": 2}, 60),
+        ({"consolidation_reconcile_interval_seconds": 300}, 60),
+    ],
+)
+def test_tick_interval_respects_enabled_jobs(monkeypatch, overrides, expected):
+    import hindsight_api.engine.maintenance as maintenance_mod
+
+    monkeypatch.setattr(maintenance_mod, "get_config", lambda: _tick_cfg(**overrides))
+    assert MaintenanceLoop._tick_interval() == expected
+
+
+@pytest.mark.asyncio
+async def test_run_waits_at_configured_reconcile_cadence(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    import hindsight_api.engine.maintenance as maintenance_mod
+
+    monkeypatch.setattr(maintenance_mod, "get_config", lambda: _tick_cfg(consolidation_reconcile_interval_seconds=5))
+    loop = MaintenanceLoop(engine=None)
+    loop._run_reconcile = AsyncMock()
+    waits = []
+
+    async def advance_time_and_stop(awaitable, timeout):
+        waits.append(timeout)
+        awaitable.close()
+        # Move the last-run timestamp back instead of waiting in real time.
+        loop._last_run["reconcile"] -= timeout
+        if len(waits) == 2:
+            loop._stop.set()
+
+    monkeypatch.setattr(maintenance_mod.asyncio, "wait_for", advance_time_and_stop)
+    await loop._run()
+
+    assert loop._run_reconcile.await_count == 2
+    assert waits == [5, 5]
+
+
 @pytest.mark.asyncio
 async def test_retention_sweep_cadence_is_configurable(monkeypatch):
     """The retention sweep's interval is server config, not a constant, and 0 disables it."""
