@@ -1,0 +1,45 @@
+# Highest matching tier wins; sensitive wins overlaps. Unmatched paths are sensitive.
+# QA reviews every change; Security reviews sensitive, unclassified, triggered,
+# or escalated changes before QA. This file is policy, not an automated guard.
+#
+# Content overrides all path classifications: endpoint or input parsing changes;
+# auth, sessions, cryptography, keys, secrets, credentials or permissions;
+# tenant isolation or personal data; SQL, schema or migrations; dependencies and
+# lockfiles (including dev dependencies); CI or workflows; weakened assertions,
+# deleted tests or snapshots, or lowered gates. These changes are sensitive.
+# Test allowlists, if added, apply only to additive unit tests.
+version: 1
+default_tier: sensitive
+tiers:
+  # A prose comparison, not executable docs, security guidance or agent instructions.
+  low:
+    - hindsight-docs/docs/developer/rag-vs-hindsight.md
+  # No module has yet been audited for an ordinary classification.
+  ordinary: []
+  # The default covers all other sensitive paths, including new paths. These
+  # explicit entries document key parts of the sensitive floor, not an exhaustive list.
+  sensitive:
+    - .github/review-tiers.yml
+    - .github/workflows/**
+    - .github/CODEOWNERS
+    - CODEOWNERS
+    - .github/rulesets/**
+    - .claude/**
+    - '**/AGENTS.md'
+    - '**/CLAUDE.md'
+    - '**/skill/**'
+    - '**/skills/**'
+    - hindsight-api-slim/**
+    - hindsight-extensions/**
+    - docker/**
+    - scripts/**
+    - '**/Dockerfile*'
+    - '**/Makefile*'
+    - '**/package.json'
+    - '**/package-lock.json'
+    - '**/pyproject.toml'
+    - '**/uv.lock'
+    - '**/Cargo.toml'
+    - '**/Cargo.lock'
+    - '**/go.mod'
+    - '**/go.sum'
